@@ -13,7 +13,7 @@ Follow these steps to set up the project locally:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/jobai.git
+git clone https://github.com/ayush123-bit/JobAI
 
 # Navigate into the project directory
 cd jobai
