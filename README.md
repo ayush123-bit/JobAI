@@ -7,6 +7,28 @@ JobAI is an AI-powered career preparation platform built using **Next.js** and i
 
 ...
 
+## 🛠️ Installation
+
+Follow these steps to set up the project locally:
+
+```bash
+# Clone the repository
+git clone https://github.com/your-username/jobai.git
+
+# Navigate into the project directory
+cd jobai
+
+# Install dependencies
+npm install
+
+# Create a .env file and add your Gemini API key and other env variables
+touch .env.local
+
+# Run the development server
+npm run dev
+
+...
+
 ## 👤 Author
 
 Created with ❤️ by **Ayush Rai**
