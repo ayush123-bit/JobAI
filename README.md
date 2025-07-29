@@ -11,7 +11,7 @@ JobAI is an AI-powered career preparation platform built using **Next.js** and i
 
 Follow these steps to set up the project locally:
 
-```bash
+
 # Clone the repository
 git clone https://github.com/your-username/jobai.git
 
@@ -25,7 +25,7 @@ npm install
 touch .env.local
 
 # Run the development server
-npm run dev```
+npm run dev
 
 ...
 
