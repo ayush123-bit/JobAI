@@ -8,10 +8,33 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ 
   model: "gemini-2.5-flash",
   generationConfig: {
-    maxOutputTokens: 1024, // Limit output to speed up response
     temperature: 0.7,
+    topP: 0.95,
+    topK: 40,
   }
 });
+
+// Helper function to extract and parse JSON from AI response
+function extractJSON(text) {
+  try {
+    // Remove markdown code blocks
+    let cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    
+    // Try to find JSON object in the text
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleaned = jsonMatch[0];
+    }
+    
+    // Parse JSON
+    const parsed = JSON.parse(cleaned);
+    return parsed;
+  } catch (e) {
+    console.error("JSON parsing failed. Raw text:", text);
+    console.error("Cleaned text:", text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+    throw new Error(`Failed to parse JSON: ${e.message}`);
+  }
+}
 
 export async function generateQuiz() {
   const { userId } = await auth();
@@ -20,6 +43,7 @@ export async function generateQuiz() {
   const user = await db.user.findUnique({
     where: { clerkUserId: userId },
     select: {
+      id: true,
       industry: true,
       skills: true,
     },
@@ -27,39 +51,76 @@ export async function generateQuiz() {
 
   if (!user) throw new Error("User not found");
 
-  const prompt = `
-    Generate 10 technical interview questions for a ${
-      user.industry
-    } professional${
+  const prompt = `You are an expert technical interviewer. Generate 10 technical interview questions for a ${
+    user.industry
+  } professional${
     user.skills?.length ? ` with expertise in ${user.skills.join(", ")}` : ""
   }.
-    
-    Each question should be multiple choice with 4 options.
-    
-    Return the response in this JSON format only, no additional text:
+
+CRITICAL REQUIREMENTS:
+1. Return ONLY valid JSON, absolutely no other text before or after
+2. Do NOT wrap in markdown code blocks
+3. Each question must have exactly 4 options
+4. correctAnswer must be one of the 4 options (exact match)
+
+Required JSON format:
+{
+  "questions": [
     {
-      "questions": [
-        {
-          "question": "string",
-          "options": ["string", "string", "string", "string"],
-          "correctAnswer": "string",
-          "explanation": "string"
-        }
-      ]
+      "question": "What is the primary purpose of React hooks?",
+      "options": ["State management", "DOM manipulation", "API calls", "Routing"],
+      "correctAnswer": "State management",
+      "explanation": "React hooks primarily enable state management and side effects in functional components."
     }
-  `;
+  ]
+}
+
+Generate 10 questions now in valid JSON format only:`;
 
   try {
     const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-    const cleanedText = text.replace(/```(?:json)?\n?/g, "").trim();
-    const quiz = JSON.parse(cleanedText);
+    const responseText = result.response.text();
+    
+    console.log("=== RAW AI RESPONSE ===");
+    console.log(responseText);
+    console.log("=== END RAW RESPONSE ===");
+    
+    // Extract and parse JSON
+    const quiz = extractJSON(responseText);
+    
+    // Validate structure
+    if (!quiz.questions || !Array.isArray(quiz.questions)) {
+      throw new Error("Invalid response: missing questions array");
+    }
+    
+    if (quiz.questions.length === 0) {
+      throw new Error("No questions generated");
+    }
+    
+    // Validate each question
+    quiz.questions.forEach((q, index) => {
+      if (!q.question || typeof q.question !== 'string') {
+        throw new Error(`Question ${index + 1}: missing or invalid question text`);
+      }
+      if (!Array.isArray(q.options) || q.options.length !== 4) {
+        throw new Error(`Question ${index + 1}: must have exactly 4 options`);
+      }
+      if (!q.correctAnswer || typeof q.correctAnswer !== 'string') {
+        throw new Error(`Question ${index + 1}: missing or invalid correctAnswer`);
+      }
+      if (!q.options.includes(q.correctAnswer)) {
+        throw new Error(`Question ${index + 1}: correctAnswer "${q.correctAnswer}" not found in options`);
+      }
+      if (!q.explanation || typeof q.explanation !== 'string') {
+        throw new Error(`Question ${index + 1}: missing explanation`);
+      }
+    });
 
     return quiz.questions;
   } catch (error) {
     console.error("Error generating quiz:", error);
-    throw new Error("Failed to generate quiz questions");
+    console.error("Error details:", error.message);
+    throw new Error(`Failed to generate quiz questions: ${error.message}`);
   }
 }
 
@@ -69,6 +130,10 @@ export async function saveQuizResult(questions, answers, score) {
 
   const user = await db.user.findUnique({
     where: { clerkUserId: userId },
+    select: {
+      id: true,
+      industry: true,
+    },
   });
 
   if (!user) throw new Error("User not found");
@@ -94,25 +159,25 @@ export async function saveQuizResult(questions, answers, score) {
       )
       .join("\n\n");
 
-    const improvementPrompt = `
-      The user got the following ${user.industry} technical interview questions wrong:
+    const improvementPrompt = `The user got the following ${user.industry} technical interview questions wrong:
 
-      ${wrongQuestionsText}
+${wrongQuestionsText}
 
-      Based on these mistakes, provide a concise, specific improvement tip.
-      Focus on the knowledge gaps revealed by these wrong answers.
-      Keep the response under 2 sentences and make it encouraging.
-      Don't explicitly mention the mistakes, instead focus on what to learn/practice.
-    `;
+Based on these mistakes, provide a concise, specific improvement tip.
+Focus on the knowledge gaps revealed by these wrong answers.
+Keep the response under 2 sentences and make it encouraging.
+Don't explicitly mention the mistakes, instead focus on what to learn/practice.
+
+Return only the improvement tip text, no extra formatting:`;
 
     try {
       const tipResult = await model.generateContent(improvementPrompt);
-
       improvementTip = tipResult.response.text().trim();
-      console.log(improvementTip);
+      console.log("Improvement tip:", improvementTip);
     } catch (error) {
       console.error("Error generating improvement tip:", error);
       // Continue without improvement tip if generation fails
+      improvementTip = "Keep practicing to improve your skills!";
     }
   }
 
@@ -140,6 +205,9 @@ export async function getAssessments() {
 
   const user = await db.user.findUnique({
     where: { clerkUserId: userId },
+    select: {
+      id: true,
+    },
   });
 
   if (!user) throw new Error("User not found");
@@ -150,7 +218,7 @@ export async function getAssessments() {
         userId: user.id,
       },
       orderBy: {
-        createdAt: "asc",
+        createdAt: "desc", // Changed to desc for most recent first
       },
     });
 
