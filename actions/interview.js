@@ -5,7 +5,13 @@ import { auth } from "@clerk/nextjs/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ 
+  model: "gemini-2.5-flash",
+  generationConfig: {
+    maxOutputTokens: 1024, // Limit output to speed up response
+    temperature: 0.7,
+  }
+});
 
 export async function generateQuiz() {
   const { userId } = await auth();
