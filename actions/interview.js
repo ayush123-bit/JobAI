@@ -228,7 +228,6 @@
 //     throw new Error("Failed to fetch assessments");
 //   }
 // }
-
 "use server";
 
 import { db } from "@/lib/prisma";
@@ -259,23 +258,30 @@ function extractJSON(text) {
   }
 }
 
-// Validate + auto-fix quiz structure
+// Validate + auto-fix quiz structure (NON-BREAKING)
 function sanitizeAndValidateQuiz(quiz) {
   if (!quiz || !Array.isArray(quiz.questions)) {
     throw new Error("Invalid quiz structure");
   }
 
-  if (quiz.questions.length !== 10) {
+  // 🔒 Hard guard: trim extra questions, fail only if insufficient
+  if (quiz.questions.length > 10) {
+    console.warn("⚠️ Extra questions detected. Trimming to 10.");
+    quiz.questions = quiz.questions.slice(0, 10);
+  }
+
+  if (quiz.questions.length < 10) {
     throw new Error(`Expected 10 questions, got ${quiz.questions.length}`);
   }
 
   quiz.questions = quiz.questions.map((q, index) => {
-    const question = q.question && q.question.trim();
+    const question = q.question?.trim();
     const options = Array.isArray(q.options)
-      ? q.options.map((o) => o.trim())
+      ? q.options.map((o) => o?.trim()).filter(Boolean)
       : [];
-    let correctAnswer = q.correctAnswer && q.correctAnswer.trim();
-    const explanation = q.explanation && q.explanation.trim();
+
+    let correctAnswer = q.correctAnswer?.trim();
+    let explanation = q.explanation?.trim();
 
     if (!question) {
       throw new Error(`Question ${index + 1}: missing question`);
@@ -293,8 +299,12 @@ function sanitizeAndValidateQuiz(quiz) {
       correctAnswer = options[0];
     }
 
+    // ✅ Auto-fill explanation instead of failing
     if (!explanation) {
-      throw new Error(`Question ${index + 1}: missing explanation`);
+      console.warn(
+        `⚠️ Question ${index + 1}: missing explanation. Auto-filling.`
+      );
+      explanation = `The correct answer is "${correctAnswer}" because it best fits the question context.`;
     }
 
     return {
@@ -308,18 +318,23 @@ function sanitizeAndValidateQuiz(quiz) {
   return quiz;
 }
 
-// Retry prompt to repair broken JSON
+// Retry prompt to repair broken JSON (STRICT)
 async function retryFixJSON(badOutput) {
   const fixPrompt = `
-Fix the following response so it becomes VALID JSON ONLY.
+You MUST fix the JSON below.
 
-Rules:
-- EXACT same schema
-- EXACTLY 10 questions
+STRICT RULES:
+- Return ONLY valid JSON
+- EXACTLY 10 questions (not more, not less)
+- Do NOT add new questions
+- Do NOT remove questions
+- Each question must have 4 options
 - correctAnswer MUST be one of the options
-- Do NOT add extra text
+- Fill ALL empty explanation fields
+- NO markdown
+- NO extra text
 
-Broken Response:
+Broken JSON:
 ${badOutput}
 `;
 
@@ -358,9 +373,10 @@ ${user.skills?.length ? `- Skills: ${user.skills.join(", ")}` : ""}
 STRICT RULES:
 1. Return ONLY valid JSON
 2. NO markdown, NO explanations outside JSON
-3. Each question must have exactly 4 options
-4. correctAnswer MUST be one of the options
-5. NO empty fields
+3. EXACTLY 10 questions
+4. Each question must have exactly 4 options
+5. correctAnswer MUST be one of the options
+6. NO empty fields
 
 JSON FORMAT:
 {
