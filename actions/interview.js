@@ -228,6 +228,7 @@
 //     throw new Error("Failed to fetch assessments");
 //   }
 // }
+
 "use server";
 
 import { db } from "@/lib/prisma";
@@ -238,18 +239,101 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Helper to extract JSON safely
+/* ----------------------------- Utilities ----------------------------- */
+
+// Safely extract JSON from LLM output
 function extractJSON(text) {
   try {
-    let cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) cleaned = jsonMatch[0];
-    return JSON.parse(cleaned);
-  } catch (e) {
-    console.error("JSON parsing failed. Raw text:", text);
-    throw new Error("Failed to parse JSON");
+    let cleaned = text
+      .replace(/```json\s*/gi, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("No JSON found");
+
+    return JSON.parse(match[0]);
+  } catch (err) {
+    console.error("❌ JSON parsing failed. RAW OUTPUT:\n", text);
+    throw new Error("Invalid JSON from AI");
   }
 }
+
+// Validate + auto-fix quiz structure
+function sanitizeAndValidateQuiz(quiz) {
+  if (!quiz || !Array.isArray(quiz.questions)) {
+    throw new Error("Invalid quiz structure");
+  }
+
+  if (quiz.questions.length !== 10) {
+    throw new Error(`Expected 10 questions, got ${quiz.questions.length}`);
+  }
+
+  quiz.questions = quiz.questions.map((q, index) => {
+    const question = q.question && q.question.trim();
+    const options = Array.isArray(q.options)
+      ? q.options.map((o) => o.trim())
+      : [];
+    let correctAnswer = q.correctAnswer && q.correctAnswer.trim();
+    const explanation = q.explanation && q.explanation.trim();
+
+    if (!question) {
+      throw new Error(`Question ${index + 1}: missing question`);
+    }
+
+    if (options.length !== 4) {
+      throw new Error(`Question ${index + 1}: must have exactly 4 options`);
+    }
+
+    // Auto-fix invalid correctAnswer
+    if (!correctAnswer || !options.includes(correctAnswer)) {
+      console.warn(
+        `⚠️ Question ${index + 1}: invalid correctAnswer. Auto-fixing.`
+      );
+      correctAnswer = options[0];
+    }
+
+    if (!explanation) {
+      throw new Error(`Question ${index + 1}: missing explanation`);
+    }
+
+    return {
+      question,
+      options,
+      correctAnswer,
+      explanation,
+    };
+  });
+
+  return quiz;
+}
+
+// Retry prompt to repair broken JSON
+async function retryFixJSON(badOutput) {
+  const fixPrompt = `
+Fix the following response so it becomes VALID JSON ONLY.
+
+Rules:
+- EXACT same schema
+- EXACTLY 10 questions
+- correctAnswer MUST be one of the options
+- Do NOT add extra text
+
+Broken Response:
+${badOutput}
+`;
+
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.1-8b-instant",
+    messages: [{ role: "user", content: fixPrompt }],
+    temperature: 0,
+    max_tokens: 1200,
+  });
+
+  return completion.choices[0]?.message?.content || "";
+}
+
+/* ----------------------------- Generate Quiz ----------------------------- */
 
 export async function generateQuiz() {
   const { userId } = await auth();
@@ -259,76 +343,74 @@ export async function generateQuiz() {
     where: { clerkUserId: userId },
     select: { id: true, industry: true, skills: true },
   });
+
   if (!user) throw new Error("User not found");
 
-  const prompt = `You are an expert technical interviewer. Generate 10 technical interview questions for a ${
-    user.industry
-  } professional${user.skills?.length ? ` with expertise in ${user.skills.join(", ")}` : ""}.
+  const prompt = `
+You are an expert technical interviewer.
 
-CRITICAL REQUIREMENTS:
-1. Return ONLY valid JSON, no extra text
-2. Do NOT wrap in markdown code blocks
+Generate EXACTLY 10 multiple-choice interview questions.
+
+Context:
+- Industry: ${user.industry}
+${user.skills?.length ? `- Skills: ${user.skills.join(", ")}` : ""}
+
+STRICT RULES:
+1. Return ONLY valid JSON
+2. NO markdown, NO explanations outside JSON
 3. Each question must have exactly 4 options
-4. correctAnswer must be one of the 4 options
+4. correctAnswer MUST be one of the options
+5. NO empty fields
 
-Required JSON format:
+JSON FORMAT:
 {
   "questions": [
     {
-      "question": "Question text",
-      "options": ["Option1", "Option2", "Option3", "Option4"],
-      "correctAnswer": "Option1",
-      "explanation": "Explanation text"
+      "question": "",
+      "options": ["", "", "", ""],
+      "correctAnswer": "",
+      "explanation": ""
     }
   ]
 }
+`;
 
-Return exactly 10 questions in valid JSON.`;
+  let rawOutput = "";
 
   try {
     const completion = await groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
+      temperature: 0.4,
       max_tokens: 1500,
     });
 
-    const responseText = completion.choices[0]?.message?.content?.trim() || "";
+    rawOutput = completion.choices[0]?.message?.content?.trim() || "";
+    console.log("=== RAW AI RESPONSE ===\n", rawOutput);
 
-    console.log("=== RAW AI RESPONSE ===");
-    console.log(responseText);
-    console.log("=== END RAW RESPONSE ===");
-
-    const quiz = extractJSON(responseText);
-
-    if (!quiz.questions || !Array.isArray(quiz.questions)) {
-      throw new Error("Invalid response: missing questions array");
-    }
-    if (quiz.questions.length !== 10) {
-      throw new Error("Expected exactly 10 questions");
-    }
-
-    // Trim all fields to avoid whitespace mismatches
-    quiz.questions.forEach((q, index) => {
-      q.question = q.question?.trim();
-      q.options = q.options?.map((opt) => opt.trim());
-      q.correctAnswer = q.correctAnswer?.trim();
-      q.explanation = q.explanation?.trim();
-
-      if (!q.question) throw new Error(`Question ${index + 1}: missing question`);
-      if (!Array.isArray(q.options) || q.options.length !== 4)
-        throw new Error(`Question ${index + 1}: must have 4 options`);
-      if (!q.options.includes(q.correctAnswer))
-        throw new Error(`Question ${index + 1}: correctAnswer not in options`);
-      if (!q.explanation) throw new Error(`Question ${index + 1}: missing explanation`);
-    });
+    let quiz = extractJSON(rawOutput);
+    quiz = sanitizeAndValidateQuiz(quiz);
 
     return quiz.questions;
-  } catch (error) {
-    console.error("Error generating quiz:", error);
-    throw new Error("Failed to generate quiz questions");
+  } catch (err) {
+    console.error("⚠️ Initial generation failed. Attempting repair...");
+
+    try {
+      const fixedOutput = await retryFixJSON(rawOutput);
+      console.log("=== FIXED AI RESPONSE ===\n", fixedOutput);
+
+      let quiz = extractJSON(fixedOutput);
+      quiz = sanitizeAndValidateQuiz(quiz);
+
+      return quiz.questions;
+    } catch (finalErr) {
+      console.error("❌ Quiz generation failed:", finalErr);
+      throw new Error("Failed to generate quiz questions");
+    }
   }
 }
+
+/* ----------------------------- Save Quiz Result ----------------------------- */
 
 export async function saveQuizResult(questions, answers, score) {
   const { userId } = await auth();
@@ -338,12 +420,13 @@ export async function saveQuizResult(questions, answers, score) {
     where: { clerkUserId: userId },
     select: { id: true, industry: true },
   });
+
   if (!user) throw new Error("User not found");
 
   const questionResults = questions.map((q, index) => ({
     question: q.question,
     answer: q.correctAnswer,
-    userAnswer: answers[index],
+    userAnswer: answers[index] ?? null,
     isCorrect: q.correctAnswer === answers[index],
     explanation: q.explanation,
   }));
@@ -351,54 +434,59 @@ export async function saveQuizResult(questions, answers, score) {
   const wrongAnswers = questionResults.filter((q) => !q.isCorrect);
 
   let improvementTip = null;
+
   if (wrongAnswers.length > 0) {
-    const wrongQuestionsText = wrongAnswers
+    const wrongText = wrongAnswers
       .map(
         (q) =>
-          `Question: "${q.question}"
-Correct Answer: "${q.answer}"
-User Answer: "${q.userAnswer}"`
+          `Question: ${q.question}
+Correct: ${q.answer}
+User: ${q.userAnswer || "No answer"}`
       )
       .join("\n\n");
 
-    const improvementPrompt = `The user got the following ${user.industry} technical interview questions wrong:
-
-${wrongQuestionsText}
-
-Provide a concise improvement tip.
-- Under 2 sentences
-- Encouraging
-- Focus on what to learn
-Return only the tip text.`;
-
     try {
-      const tipCompletion = await groq.chat.completions.create({
+      const completion = await groq.chat.completions.create({
         model: "llama-3.1-8b-instant",
-        messages: [{ role: "user", content: improvementPrompt }],
-        temperature: 0.5,
+        messages: [
+          {
+            role: "user",
+            content: `
+The user missed these ${user.industry} interview questions:
+
+${wrongText}
+
+Give ONE concise improvement tip.
+Rules:
+- Max 2 sentences
+- Encouraging
+- Plain text only`,
+          },
+        ],
+        temperature: 0.4,
         max_tokens: 80,
       });
-      improvementTip = tipCompletion.choices[0]?.message?.content?.trim();
+
+      improvementTip =
+        completion.choices[0]?.message?.content?.trim() ||
+        "Keep practicing core concepts.";
     } catch {
-      improvementTip = "Keep practicing to improve your skills!";
+      improvementTip = "Keep practicing core concepts.";
     }
   }
 
-  try {
-    return await db.assessment.create({
-      data: {
-        userId: user.id,
-        quizScore: score,
-        questions: questionResults,
-        category: "Technical",
-        improvementTip,
-      },
-    });
-  } catch (error) {
-    console.error("Error saving quiz result:", error);
-    throw new Error("Failed to save quiz result");
-  }
+  return db.assessment.create({
+    data: {
+      userId: user.id,
+      quizScore: score,
+      questions: questionResults,
+      category: "Technical",
+      improvementTip,
+    },
+  });
 }
+
+/* ----------------------------- Fetch Assessments ----------------------------- */
 
 export async function getAssessments() {
   const { userId } = await auth();
@@ -408,6 +496,7 @@ export async function getAssessments() {
     where: { clerkUserId: userId },
     select: { id: true },
   });
+
   if (!user) throw new Error("User not found");
 
   return db.assessment.findMany({
